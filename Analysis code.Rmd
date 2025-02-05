@@ -1,0 +1,879 @@
+---
+title: "ML analysis January 2025 "
+author: "Anika"
+date: "2025-01-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+if(!require('pacman')) {install.packages('pacman')}
+pacman::p_load(tidyverse, haven, ISLR, ISLR2, readxl, magrittr, dplyr, glmnet, tree, scales, ROCR, ggplot2, MASS, ISLR2, e1071, class, boot, randomForest, caret, e1071, webr, smotefamily, xgboost, pROC,ConfusionTableR, smotefamily)
+
+setwd("D:/NCERDC_DATA/Alam/ML")
+```
+
+
+## Model 1: logistic regression
+
+This regression is trained on original, highly imbalanced training data with class of 2017 data and is cross-validated with class of 2018 data. 
+```{r}
+train <- read.csv("train.csv")
+test <- read.csv("test.csv")
+
+
+# Fit the logistic regression model
+log1.m <- glm(dropout ~ ., data = subset(train, select = -c(female, hispanic, asian, black, white, other_race)), family = 'binomial')
+summary(log1.m)
+
+# Predict on the TEST data
+predict_log <- predict(log1.m, test[,-1], type = 'response')
+
+# Create a prediction object for ROCR
+pred <- prediction(predict_log, test$dropout)
+
+# Create a performance object for ROC curve
+perf_log <- performance(pred, "tpr", "fpr")
+
+# Plot the ROC curve
+plot(perf_log, colorize = TRUE, main = "ROC Curve")
+
+# Optional: Add a threshold line
+abline(h = 0.8, col = "red", lty = 2)  # Adjust according to your needs
+
+
+# AuC score
+auc <- performance(pred, measure = "auc")
+auc@y.values[[1]]
+
+# Convert predictions to factors (assuming binary classification)
+predict_log_class <- as.factor(ifelse(predict_log >= 0.2, 1, 0))
+test$dropout <- as.factor(test$dropout)
+
+# Create confusion matrix
+cm <- confusionMatrix(data = predict_log_class, reference = test$dropout, positive = "1")
+print(cm)
+f1_score <- cm$byClass["F1"]
+print(f1_score)
+```
+
+
+## Preparing for lasso and ridge regression
+
+I recode a discrete variable, urbanicity, as a numeric variable. I also vectorize my predictors and outcome data for train and test data. 
+```{r}
+str(train)
+str(test)
+
+# Define a function to recode urbanicity
+recode_urbanicity <- function(df) {
+  df %>%
+    mutate(
+      urbanicity = recode_factor(
+        urbanicity,
+        `1` = "Rural",
+        `2` = "Town",
+        `3` = "Suburban",
+        `4` = "Urban",
+        .ordered = TRUE
+      )
+    )
+}
+
+# Apply the function to both train and test data frames
+train <- train %>%
+  mutate(urbanicity = as.factor(urbanicity)) %>%
+  recode_urbanicity()
+
+test <- test %>%
+  mutate(urbanicity = as.factor(urbanicity)) %>%
+  recode_urbanicity()
+
+# Check the structure of the test data frame
+str(test$urbanicity)
+train$urbanicity <- as.numeric(train$urbanicity)
+test$urbanicity <- as.numeric(test$urbanicity)
+str(test$urbanicity)
+str(train$urbanicity)
+
+y.train = train$dropout %>% unlist() %>% as.numeric()
+y.test = test$dropout %>% unlist() %>% as.numeric()
+x.train = model.matrix(dropout~., train)[,-1] #data should only be predictors 
+x.train <- x.train[, -c(26:31)]
+x.test = model.matrix(dropout~., test)[,-1]
+x.test <- x.test[, -c(26:31)]
+
+dim(x.train)
+dim(x.test)
+
+
+write.csv(x.train,'x.train.csv', row.names=FALSE)
+write.csv(x.test,'x.test.csv', row.names=FALSE)
+write.csv(y.train,'y.train.csv', row.names=FALSE)
+write.csv(y.test,'y.test.csv', row.names=FALSE)
+```
+
+## Model 2: Lasso regression
+
+I run a cross-validation exercise to estimate the best lambda for the lasso model and use it on the testing data.
+```{r}
+x.train <- read.csv("x.train.csv")
+x.test <- read.csv("x.test.csv")
+y.train <- read.csv("y.train.csv")
+y.test <- read.csv("y.test.csv")
+
+
+#CV to estimate best lambda
+set.seed(2023)
+cv.lasso <- cv.glmnet(x.train, y.train, alpha = 1, family='binomial') # Fit lasso regression model on training data
+#Display MSE vs log-lambda plot
+plot(cv.lasso) # Draw plot of training MSE as a function of lambda
+
+
+# Extract the coefficients at the best lambda (lambda.min or lambda.1se)
+lasso.coefs <- coef(cv.lasso, s = "lambda.min")  # or use lambda.1se for a more regularized solution
+
+# View the coefficients
+print(lasso.coefs)
+
+# To view the coefficients in a more readable format (as a dataframe):
+lasso.coefs_df <- as.data.frame(as.matrix(lasso.coefs))
+print(lasso.coefs_df)
+print(lasso.coefs[lasso.coefs != 0]) # Display only non-zero coefficients
+lasso.coefs_df <- lasso.coefs_df %>%
+  arrange(desc(s1))
+print(lasso.coefs_df)
+write.csv(lasso.coefs_df, "lasso.coefs.csv", row.names = TRUE)
+
+
+# ROC analysis to identify optimal threshold
+lasso.pred <- predict(cv.lasso, newx=x.test, s = "lambda.min", type="response")
+# Ensure lasso.pred is a numeric vector
+lasso.pred <- as.numeric(lasso.pred)
+print(length(lasso.pred))  # Check length of lasso.pred
+
+
+
+#Create ROC curve
+pred_lasso <- prediction(lasso.pred, y.test)
+y.test <- as.matrix(y.test)
+perf_lasso <- performance(pred_lasso , "tpr", "fpr")
+plot(perf_lasso, colorize=TRUE) #lasso prob threshold should be 0.2
+abline(h = 0.8, col = "red", lty = 2)  # Add threshold line
+
+# AuC score
+auc <- performance(pred_lasso, measure = "auc")
+auc@y.values[[1]]
+
+# Convert predictions to factors 
+predict_lasso_class <- as.factor(ifelse(lasso.pred >= 0.2, "1", "0"))
+# Ensure test$dropout is a factor with the same levels
+test$dropout <- as.factor(test$dropout)
+levels(predict_lasso_class) <- levels(test$dropout)  # Ensure factor levels match
+
+# Create confusion matrix
+cm <- confusionMatrix(data = predict_lasso_class, reference = test$dropout, positive = "1")
+print(cm)
+f1_score <- cm$byClass["F1"]
+print(f1_score)
+
+
+#How many variables were selected at this optimal lambda? 
+#out = glmnet(x.test, y.test, alpha = 1, lambda = bestlam) # Fit lasso model on full dataset
+#lasso_coef = predict(out, type = "coefficients", s = bestlam) # Display coefficients using lambda chosen by CV
+#lasso_coef[lasso_coef != 0] # Display only non-zero coefficients
+
+```
+
+
+## Model 3:Ridge regression 
+
+```{r}
+
+#CV to estimate best lambda
+set.seed(2023)
+cv.ridge <- cv.glmnet(x.train, y.train, alpha = 0, family='binomial') # Fit ridge regression model on training data
+#Display MSE vs log-lambda plot
+plot(cv.ridge) # Draw plot of training MSE as a function of lambda
+
+ridge.pred <- predict(cv.ridge, newx=x.test, s = "lambda.min", type="response")
+# Ensure lasso.pred is a numeric vector
+ridge.pred <- as.numeric(ridge.pred)
+print(length(ridge.pred))  # Check length of lasso.pred
+
+
+# Extract the coefficients at the best lambda (lambda.min or lambda.1se)
+ridge.coefs <- coef(cv.ridge, s = "lambda.min")  # or use lambda.1se for a more regularized solution
+
+# View the coefficients
+print(ridge.coefs)
+
+# To view the coefficients in a more readable format (as a dataframe):
+ridge.coefs_df <- as.data.frame(as.matrix(ridge.coefs))
+print(ridge.coefs[ridge.coefs != 0]) # Display only non-zero coefficients
+ridge.coefs_df <- ridge.coefs_df %>%
+  arrange(desc(s1))
+print(ridge.coefs_df)
+write.csv(ridge.coefs_df, "ridge.coefs.csv", row.names = TRUE)
+
+
+#Create ROC curve
+pred_ridge <- prediction(ridge.pred, y.test)
+y.test <- as.matrix(y.test)
+perf_ridge <- performance(pred_ridge , "tpr", "fpr")
+plot_ridge <- plot(perf_ridge, colorize=TRUE) #lasso prob threshold should be 0.2
+abline(h = 0.8, col = "red", lty = 2)  # Add threshold line
+
+# AuC
+perf_ridge <- performance(pred_ridge,"auc")
+auc <- as.numeric(perf_ridge@y.values)
+auc
+
+# Convert predictions to factors 
+predict_ridge_class <- as.factor(ifelse(ridge.pred >= 0.2, "1", "0"))
+# Ensure test$dropout is a factor with the same levels
+test$dropout <- as.factor(test$dropout)
+levels(predict_ridge_class) <- levels(test$dropout)  # Ensure factor levels match
+
+# Create confusion matrix
+cm <- confusionMatrix(data = predict_ridge_class, reference = test$dropout, positive = "1")
+print(cm)
+f1_score <- cm$byClass["F1"]
+print(f1_score)
+```
+
+## Model 4: Random forest
+
+```{r}
+train <- read.csv("train.csv")
+test <- read.csv("test.csv")
+train_nodem <- train[, -c(26:31)]
+str(train_nodem)
+train_nodem$dropout <- as.factor(train_nodem$dropout)
+# Running RF
+set.seed(2023)
+RF.dropout <- randomForest(dropout ~ ., data = train_nodem, ntree = 100, importance = TRUE)
+
+# Print model summary and variable importance
+print(RF.dropout)
+varImpPlot(RF.dropout,n.var=min(15, nrow(RF.dropout$importance)), type=NULL, class=NULL, scale=TRUE)
+importance(RF.dropout)
+
+# Predict on the TEST data
+rf.pred <- predict(RF.dropout, newdata = test[,-1], type = "prob")[,2]
+
+# Create a prediction object for ROCR
+rf_pr_test <- prediction(rf.pred, test$dropout)
+
+# Create a performance object for ROC curve
+perf_rf <- performance(rf_pr_test, "tpr", "fpr")
+
+# Plot the ROC curve
+plot(perf_rf, colorize = TRUE, main = "ROC Curve")
+abline(h = 0.8, col = "red", lty = 2)  # Adjust according to your needs
+
+# Calculate AUC
+auc <- performance(rf_pr_test, measure = "auc")
+print(auc@y.values[[1]])
+
+# Convert predictions to binary class (assuming binary classification)
+predict_rf_class <- as.factor(ifelse(rf.pred >= 0.22, 1, 0))
+test$dropout <- as.factor(test$dropout)
+
+# Create confusion matrix
+cm <- confusionMatrix(data = predict_rf_class, reference = test$dropout, positive = "1")
+print(cm)
+
+# F1 Score
+f1_score <- cm$byClass["F1"]
+print(f1_score)
+
+# Plot Random Forest MSE
+plot(RF.dropout)
+```
+
+
+## Model 5: XGboost  
+
+
+```{r}
+train <- read.csv("train.csv")
+test <- read.csv("test.csv")
+str(train)
+str(test)
+
+# eta controls the learning rate, which scales the contribution of each tree. A smaller value (e.g., 0.1) can lead to more robust models but requires more boosting rounds. The default value of 0.3 is more aggressive
+
+# eval_metric specifies the metric to evaluate during training. The detailed parameter set explicitly specifies "logloss", which is useful for binary classification tasks.
+
+# gamma specifies the minimum loss reduction required to make a further partition. Setting gamma to 0 means no regularization is applied to the tree splitting, which may lead to more complex trees.
+
+# min_child_weight is the minimum sum of instance weight (hessian) needed in a child. It controls overfitting; higher values prevent the model from learning overly specific patterns.
+
+# Data preparation
+dtrain <- xgb.DMatrix(data = x.train, label = y.train)
+dtest <- xgb.DMatrix(data = x.test, label = y.test)
+ts_label <- test$dropout
+
+
+# Initial parameter setup (if needed)
+initial_params <- list(
+  booster = "gbtree",
+  objective = "binary:logistic",
+  eval_metric = "logloss",
+  eta = 0.3,
+  max_depth = 6, gamma = 3
+)
+
+# Cross-validation to find optimal rounds of boosting
+cv_results <- xgb.cv(
+  params = initial_params,
+  data = dtrain,
+  nrounds = 100,
+  nfold = 5,
+  early_stopping_rounds = 20,
+  verbose = 1
+)
+
+# Extract the Best Number of Rounds
+best_nrounds <- cv_results$best_iteration
+
+# Train the Final Model with Optimal Parameters
+set.seed(2023)
+final_model <- xgb.train(
+  params = initial_params,
+  data = dtrain,
+  nrounds = best_nrounds
+)
+
+# Grid search for hyperparameter tuning
+search_grid <- expand.grid(
+  max_depth = c(3, 6),
+  eta = c(0.01, 0.1),
+  colsample_bytree = c(0.5, 0.7)
+)
+
+best_auc <- Inf  # Use Inf for minimization
+best_params <- list()
+
+for (i in 1:nrow(search_grid)) {
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    max_depth = search_grid$max_depth[i],
+    eta = search_grid$eta[i],
+    colsample_bytree = search_grid$colsample_bytree[i]
+  )
+  
+  cv_results <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nfold = 5,
+    nrounds = 100,
+    early_stopping_rounds = 10,
+    verbose = 1
+  )
+  
+  mean_logloss <- min(cv_results$evaluation_log$test_logloss_mean)
+  
+  if (mean_logloss < best_auc) {
+    best_auc <- mean_logloss
+    best_params <- params
+    best_nrounds <- cv_results$best_iteration
+  }
+}
+
+# Train the final model with the best parameters
+dtest <- xgb.DMatrix(data = x.test, label = y.test)
+set.seed(2023)
+xgb1 <- xgb.train (params = best_params, data = dtrain, watchlist = list(val=dtest,train=dtrain), print_every_n = 10, nrounds = best_nrounds)
+#model prediction
+xgbpred <- predict (xgb1,dtest)
+xgbpred <- ifelse (xgbpred > 0.18,"1", "0")
+
+y.test <- as.factor(y.test)
+xgbpred <- as.factor(xgbpred)
+y.test = test$dropout %>% unlist() %>% as.factor()
+
+# Create confusion matrix
+cm <- confusionMatrix(data = xgbpred, reference = y.test, positive = "1")
+print(cm)
+f1_score <- cm$byClass["F1"]
+print(f1_score)
+mat <- xgb.importance (feature_names = colnames(x.train),model = xgb1)
+xgb.plot.importance (importance_matrix = mat[1:20]) 
+
+# Generate predictions on the test set
+# Ensure xgb1 is your trained model and dtest is prepared with xgb.DMatrix
+pred_probs <- predict(xgb1, dtest)
+
+# Extract true labels from dtest
+# If your dtest has labels, use getinfo to retrieve them
+true_labels <- getinfo(dtest, "label")
+
+# Calculate ROC curve
+roc_result <- roc(true_labels, pred_probs)
+
+# Print AUC
+print(paste("AUC:", auc(roc_result)))
+# Plot ROC curve
+plot(roc_result, main = "ROC Curve", col = "blue", lwd = 2)
+
+# Feature importance plot
+mat <- xgb.importance (feature_names = colnames(new_tr),model = xgb1)
+xgb.plot.importance (importance_matrix = mat[1:10]) 
+
+```
+
+## Generating synthetic data (SMOTE)
+
+```{r}
+#trying SMOTE
+train <- read.csv("train.csv")
+library(caret)
+library(nnet)
+# Convert dropout to a factor
+train$dropout <- as.numeric(train$dropout)
+summary(train)
+# Apply SMOTE
+set.seed(123) # For reproducibility
+smote_result <- SMOTE(X = train, target = train$dropout, 
+                      K = 3, dup_size = 0)
+
+# Combine the SMOTE result into a new data frame
+smotetrain <- data.frame(smote_result$data)
+
+# Check the distribution of the target variable after SMOTE
+table(smotetrain$dropout)
+table(train$dropout)
+
+smotetrain$dropout <- as.numeric(smotetrain$dropout)
+library(dplyr)
+train$dropout <- as.factor(train$dropout)
+
+#recoding dropout from 1,2 to 0,1
+smotetrain2 <- smotetrain2 %>%  mutate(dropout = recode(dropout, `1` = 0, `2` = 1))
+table(smotetrain2$dropout)
+
+write.csv(smotetrain,"oversampletrain.csv", row.names=FALSE)
+
+```
+
+## Model 6: SMOTE logistic regression
+
+https://www.r-bloggers.com/2021/05/class-imbalance-handling-imbalanced-data-in-r/
+
+```{r}
+smotetrain <- read.csv("oversampletrain.csv")
+test <- read.csv("test.csv")
+
+# Fit the logistic regression model
+log1.m <- glm(dropout ~ ., data = subset(smotetrain, select = -c(female, hispanic, asian, black, white, other_race)), family = 'binomial')
+summary(log1.m)
+
+# Predict on the TEST data
+predict_log <- predict(log1.m, test[,-1], type = 'response')
+
+# Create a prediction object for ROCR
+pred <- prediction(predict_log, test$dropout)
+
+# Create a performance object for ROC curve
+perf_log <- performance(pred, "tpr", "fpr")
+
+# Plot the ROC curve
+plot(perf_log, colorize = TRUE, main = "ROC Curve")
+abline(h = 0.8, col = "red", lty = 2)  # Add a threshold line
+
+# AuC score
+auc <- performance(pred, measure = "auc")
+auc@y.values[[1]]
+
+# Convert predictions to factors (assuming binary classification)
+predict_log_class <- as.factor(ifelse(predict_log >= 0.2, 1, 0))
+test$dropout <- as.factor(test$dropout)
+
+# Create confusion matrix
+cm <- confusionMatrix(data = predict_log_class, reference = test$dropout, positive = "1")
+print(cm)
+f1_score <- cm$byClass["F1"]
+print(f1_score)
+```
+
+## Preparing for SMOTE lasso and ridge
+
+```{r}
+train <- read.csv("oversampletrain.csv")
+test <- read.csv("test.csv")
+str(train)
+str(test)
+
+# Define a function to recode urbanicity
+recode_urbanicity <- function(df) {
+  df %>%
+    mutate(
+      urbanicity = recode_factor(
+        urbanicity,
+        `1` = "Rural",
+        `2` = "Town",
+        `3` = "Suburban",
+        `4` = "Urban",
+        .ordered = TRUE
+      )
+    )
+}
+
+# Apply the function to both train and test data frames
+train <- train %>%
+  mutate(urbanicity = as.factor(urbanicity)) %>%
+  recode_urbanicity()
+
+test <- test %>%
+  mutate(urbanicity = as.factor(urbanicity)) %>%
+  recode_urbanicity()
+
+# Check the structure of the test data frame
+str(test$urbanicity)
+train$urbanicity <- as.numeric(train$urbanicity)
+test$urbanicity <- as.numeric(test$urbanicity)
+str(test$urbanicity)
+str(train$urbanicity)
+
+y.train = train$dropout %>% unlist() %>% as.numeric()
+y.test = test$dropout %>% unlist() %>% as.numeric()
+x.train = model.matrix(dropout~., train)[,-1] #data should only be predictors 
+x.train <- x.train[, -c(26:31)]
+x.test = model.matrix(dropout~., test)[,-1]
+x.test <- x.test[, -c(26:31)]
+
+dim(x.train)
+dim(x.test)
+
+
+write.csv(x.train,'x.train.csv', row.names=FALSE)
+write.csv(x.test,'x.test.csv', row.names=FALSE)
+write.csv(y.train,'y.train.csv', row.names=FALSE)
+write.csv(y.test,'y.test.csv', row.names=FALSE)
+```
+
+
+## Model 7: SMOTE lasso regression
+
+```{r}
+set.seed(2023)
+cv.lasso <- cv.glmnet(x.train, y.train, alpha = 1, family='binomial') # Fit lasso regression model on training data
+#Display MSE vs log-lambda plot
+plot(cv.lasso) # Draw plot of training MSE as a function of lambda
+
+# Extract the coefficients at the best lambda (lambda.min or lambda.1se)
+lasso.coefs <- coef(cv.lasso, s = "lambda.min")  # or use lambda.1se for a more regularized solution
+
+# View the coefficients
+print(lasso.coefs)
+
+# To view the coefficients in a more readable format (as a dataframe):
+lasso.coefs_df <- as.data.frame(as.matrix(lasso.coefs))
+print(lasso.coefs_df)
+print(lasso.coefs[lasso.coefs != 0]) # Display only non-zero coefficients
+lasso.coefs_df <- lasso.coefs_df %>%
+  arrange(desc(s1))
+print(lasso.coefs_df)
+write.csv(lasso.coefs_df, "lasso.smote.coefs.csv", row.names = TRUE)
+
+# ROC analysis to identify optimal threshold
+lasso.pred <- predict(cv.lasso, newx=x.test, s = "lambda.min", type="response")
+# Ensure lasso.pred is a numeric vector
+lasso.pred <- as.numeric(lasso.pred)
+print(length(lasso.pred))  # Check length of lasso.pred
+
+#Create ROC curve
+pred_lasso <- prediction(lasso.pred, y.test)
+y.test <- as.matrix(y.test)
+perf_lasso <- performance(pred_lasso , "tpr", "fpr")
+plot(perf_lasso, colorize=TRUE) #lasso prob threshold should be 0.2
+abline(h = 0.8, col = "red", lty = 2)  # Add threshold line
+
+# AuC score
+auc <- performance(pred_lasso, measure = "auc")
+auc@y.values[[1]]
+
+# Convert predictions to factors 
+predict_lasso_class <- as.factor(ifelse(lasso.pred >= 0.2, "1", "0"))
+# Ensure test$dropout is a factor with the same levels
+test$dropout <- as.factor(test$dropout)
+levels(predict_lasso_class) <- levels(test$dropout)  # Ensure factor levels match
+
+# Create confusion matrix
+cm <- confusionMatrix(data = predict_lasso_class, reference = test$dropout, positive = "1")
+print(cm)
+f1_score <- cm$byClass["F1"]
+print(f1_score)
+```
+
+## Model 8: SMOTE ridge regression
+
+
+```{r}
+#CV to estimate best lambda
+set.seed(2023)
+cv.ridge <- cv.glmnet(x.train, y.train, alpha = 0, family='binomial') # Fit ridge regression model on training data
+#Display MSE vs log-lambda plot
+plot(cv.ridge) # Draw plot of training MSE as a function of lambda
+
+# Extract the coefficients at the best lambda (lambda.min or lambda.1se)
+ridge.coefs <- coef(cv.ridge, s = "lambda.min")  # or use lambda.1se for a more regularized solution
+
+# View the coefficients
+print(ridge.coefs)
+
+# To view the coefficients in a more readable format (as a dataframe):
+ridge.coefs_df <- as.data.frame(as.matrix(ridge.coefs))
+print(ridge.coefs[ridge.coefs != 0]) # Display only non-zero coefficients
+#ridge.coefs_df <- ridge.coefs_df %>%
+  arrange(desc(s1))
+print(ridge.coefs_df)
+write.csv(ridge.coefs_df, "ridge.smote.coefs.csv", row.names = TRUE)
+
+ridge.pred <- predict(cv.ridge, newx=x.test, s = "lambda.min", type="response")
+# Ensure lasso.pred is a numeric vector
+ridge.pred <- as.numeric(ridge.pred)
+print(length(ridge.pred))  # Check length of lasso.pred
+
+
+#Create ROC curve
+pred_ridge <- prediction(ridge.pred, y.test)
+y.test <- as.matrix(y.test)
+perf_ridge <- performance(pred_ridge , "tpr", "fpr")
+plot_ridge <- plot(perf_ridge, colorize=TRUE) #lasso prob threshold should be 0.2
+abline(h = 0.8, col = "red", lty = 2)  # Add threshold line
+
+# AuC
+perf_ridge <- performance(pred_ridge,"auc")
+auc <- as.numeric(perf_ridge@y.values)
+auc
+
+# Convert predictions to factors 
+predict_ridge_class <- as.factor(ifelse(ridge.pred >= 0.2, "1", "0"))
+# Ensure test$dropout is a factor with the same levels
+test$dropout <- as.factor(test$dropout)
+levels(predict_ridge_class) <- levels(test$dropout)  # Ensure factor levels match
+
+# Create confusion matrix
+cm <- confusionMatrix(data = predict_ridge_class, reference = test$dropout, positive = "1")
+print(cm)
+f1_score <- cm$byClass["F1"]
+print(f1_score)
+```
+
+
+## Model 9: SMOTE random forest
+
+```{r}
+train <- read.csv("oversampletrain.csv")
+test <- read.csv("test.csv")
+train_nodem <- train[, -c(26:31)]
+str(train_nodem)
+train_nodem$dropout <- as.factor(train_nodem$dropout )
+# Running RF
+set.seed(2023)
+RF.dropout <- randomForest(dropout ~ ., data = train_nodem, ntree = 100, importance = TRUE)
+
+# Print model summary and variable importance
+print(RF.dropout)
+varImpPlot(RF.dropout,n.var=min(20, nrow(RF.dropout$importance)), type=NULL, class=NULL, scale=TRUE)
+importance(RF.dropout)
+
+# Predict on the TEST data
+rf.pred <- predict(RF.dropout, newdata = test[,-1], type = "prob")[,2]
+
+# Create a prediction object for ROCR
+rf_pr_test <- prediction(rf.pred, test$dropout)
+
+# Create a performance object for ROC curve
+perf_rf <- performance(rf_pr_test, "tpr", "fpr")
+
+# Plot the ROC curve
+plot(perf_rf, colorize = TRUE, main = "ROC Curve")
+abline(h = 0.8, col = "red", lty = 2)  # Adjust according to your needs
+
+# Calculate AUC
+auc <- performance(rf_pr_test, measure = "auc")
+print(auc@y.values[[1]])
+
+# Convert predictions to binary class (assuming binary classification)
+predict_rf_class <- as.factor(ifelse(rf.pred >= 0.22, 1, 0))
+test$dropout <- as.factor(test$dropout)
+
+# Create confusion matrix
+cm <- confusionMatrix(data = predict_rf_class, reference = test$dropout, positive = "1")
+print(cm)
+
+# F1 Score
+f1_score <- cm$byClass["F1"]
+print(f1_score)
+
+# Plot Random Forest MSE
+plot(RF.dropout)
+```
+
+
+
+
+## Model 10: SMOTE xgboost
+
+```{r}
+train <- read.csv("oversampletrain.csv")
+test <- read.csv("test.csv")
+str(train)
+str(test)
+
+# Data preparation
+dtrain <- xgb.DMatrix(data = x.train, label = y.train)
+
+# Initial parameter setup (if needed)
+initial_params <- list(
+  booster = "gbtree",
+  objective = "binary:logistic",
+  eval_metric = "logloss",
+  eta = 0.1,
+  max_depth = 6
+)
+
+# Cross-validation to find optimal rounds of boosting
+set.seed(2023)
+cv_results <- xgb.cv(
+  params = initial_params,
+  data = dtrain,
+  nrounds = 100,
+  nfold = 5,
+  early_stopping_rounds = 20,
+  verbose = 1
+)
+
+# Extract the Best Number of Rounds
+best_nrounds <- cv_results$best_iteration
+
+# Train the Final Model with Optimal Parameters
+set.seed(2023)
+final_model <- xgb.train(
+  params = initial_params,
+  data = dtrain,
+  nrounds = best_nrounds
+)
+
+# Grid search for hyperparameter tuning
+search_grid <- expand.grid(
+  max_depth = c(3, 6),
+  eta = c(0.01, 0.1),
+  colsample_bytree = c(0.5, 0.7)
+)
+
+best_auc <- Inf  # Use Inf for minimization
+best_params <- list()
+
+for (i in 1:nrow(search_grid)) {
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    max_depth = search_grid$max_depth[i],
+    eta = search_grid$eta[i],
+    colsample_bytree = search_grid$colsample_bytree[i]
+  )
+  
+  cv_results <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nfold = 5,
+    nrounds = 100,
+    early_stopping_rounds = 10,
+    verbose = 1
+  )
+  
+  mean_logloss <- min(cv_results$evaluation_log$test_logloss_mean)
+  
+  if (mean_logloss < best_auc) {
+    best_auc <- mean_logloss
+    best_params <- params
+    best_nrounds <- cv_results$best_iteration
+  }
+}
+
+# Train the final model with the best parameters
+dtest <- xgb.DMatrix(data = x.test, label = y.test)
+set.seed(2023)
+xgb1 <- xgb.train (params = best_params, data = dtrain, watchlist = list(val=dtest,train=dtrain), print.every.n = 10, nrounds = best_nrounds)
+#model prediction
+xgbpred <- predict (xgb1,dtest)
+xgbpred <- ifelse (xgbpred > 0.2,"1", "0")
+
+y.test <- as.factor(y.test)
+xgbpred <- as.factor(xgbpred)
+y.test = test$dropout %>% unlist() %>% as.factor()
+
+# Create confusion matrix
+cm <- confusionMatrix(data = xgbpred, reference = y.test, positive = "1")
+print(cm)
+f1_score <- cm$byClass["F1"]
+print(f1_score)
+
+#Feature importance plot
+mat <- xgb.importance (feature_names = colnames(x.train),model = xgb1)
+xgb.plot.importance (importance_matrix = mat[1:10]) 
+
+# Assuming you have the importance matrix 'mat' and your model 'xgb1'
+mat <- xgb.importance(feature_names = colnames(x.train), model = xgb1)
+
+# Convert the importance matrix to a data frame for ggplot2
+importance_df <- as.data.frame(mat)
+
+# Define a mapping of old feature names to new feature names
+name_mapping <- c(
+  "age_eighthfall1" = "Age at 8th grade",
+  "ever_chrabsent_middle" = "Chronically absent in a middle grade",
+  "absence_rate_8" = "8th grade absence rate",
+  "absence_rate_7" = "7th grade absence rate",
+  "eds" = "Economically disadvantaged",
+  "ever_stsusp_middle" = "Receiving ST suspension in a middle grade",
+  "not_math_proficient_8" = "Not proficient in 8th grade math",
+  "ever_suspended" = "Suspended in a middle grade",
+  "not_read_proficient_8" = "Not proficient in 8th grade reading",
+   "not_math_proficient_7" = "Not proficient in 7th grade math"
+)
+
+# Replace old feature names with new feature names
+importance_df$Feature <- ifelse(importance_df$Feature %in% names(name_mapping),
+                                name_mapping[importance_df$Feature],
+                                importance_df$Feature)
+
+extrafont::loadfonts(device="win")
+library(ggplot2)
+library(extrafont)
+loadfonts(device = "win")
+font_import(paths = NULL, recursive = TRUE, prompt = TRUE,pattern = "Times")
+
+
+
+base_fig <- ggplot(importance_df[1:20, ], aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 10 Features by Gain",
+       x = "Feature",
+       y = "Gain") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 14, face = "bold"),
+        legend.position = "none", windowsFonts(Times=windowsFont("TT Times New Roman"))
+
+)
+
+base_fig +
+  theme(text = element_text(family = "Times New Roman"))
+
+# Calculate SHAP values
+shap_values <- shap.values(xgb_model = xgb1, X_train = x.train)
+shap_long <- shap.prep(shap_contrib = shap_values$shap_score, X_train = x.train)
+
+# Visualize SHAP summary plot
+shap.plot.summary(shap_long)
+```
